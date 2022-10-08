@@ -1,0 +1,142 @@
+#!/usr/bin/env ruby
+
+require 'yaml'
+require 'optparse'
+require 'pg'
+require 'faker'
+
+$:.unshift "#{__dir__}/../lib"
+require 'sql_anonymizer/core_ext'
+require 'sql_anonymizer/anonymizer'
+require 'sql_anonymizer/config'
+require 'sql_anonymizer/my_faker'
+require 'sql_anonymizer/status'
+
+config_file = nil
+schema_file = nil
+input_file = nil
+output_file = nil
+database_mode = :pg
+$verbose = false
+$consistent = false
+$progress = false
+$rechunk = false
+$table_level_default = :exclude # exclude unconfigured tables by default
+
+OptionParser.new do |opts|
+  opts.banner = "Usage: #{$0} [options]"
+
+  opts.on("-c", "--config [FILE]", "Config File") do |v|
+    config_file = v
+  end
+  opts.on("-s", "--schema [FILE]", "Schema File") do |v|
+    schema_file = v
+  end
+  opts.on("-i", "--input [FILE]", "Input File") do |v|
+    input_file = v
+  end
+  opts.on("-o", "--output [FILE]", "Output File") do |v|
+    output_file = v
+  end
+  opts.on("-m", "--mysql", "Expect MySQL format input") do |v|
+    database_mode = :mysql
+  end
+  opts.on("-p", "--progress", "Report overall progress (only works with file input, not stdin)") do |v|
+    $progress = true
+  end
+  opts.on("-v", "--verbose", "Verbose mode - print status messages and timing information") do |v|
+    $verbose = true
+  end
+  opts.on("--consistent", "Consistent mode (slower) - attempts to generate the same output values for the same input values instead of being purely random") do |v|
+    $consistent = true
+  end
+  opts.on("--rechunk", "Break large COPY blocks into smaller ones") do |v|
+    $rechunk = true
+  end
+  opts.on("--pass-by-default", "[DO NOT USE THIS]") do |v|
+    $table_level_default = :pass
+  end
+end.parse!
+
+config_file ||= %w[config/anonymize-sql.yaml config/anonymize-sql.yml anonymize-sql.yml].find {|f| File.exist?(f) }
+config_file ||= 'anonymize-sql.yaml'
+
+errors = []
+errors << "Configuration file #{config_file.inspect} not found!" unless File.exist?(config_file)
+errors << "Schema file #{schema_file.inspect} not found!" unless schema_file.nil? || File.exist?(schema_file)
+errors << "Input file #{input_file.inspect} not found!" unless input_file.nil? || File.exist?(input_file)
+
+if errors.length > 0
+  STDERR.puts errors
+  exit!(-1)
+end
+
+case database_mode
+when :mysql
+  require 'sql_anonymizer/mysql'
+else
+  require 'sql_anonymizer/pg'
+end
+
+include SqlAnonymizer::Anonymizer
+include SqlAnonymizer::Config
+include SqlAnonymizer::MyFaker
+include SqlAnonymizer::Status
+
+case database_mode
+when :mysql
+  include SqlAnonymizer::Mysql
+else
+  include SqlAnonymizer::Pg
+end
+
+load_config(config_file)
+
+$schema = schema_file.nil? ? nil : File.open(schema_file, 'r')
+$input = input_file.nil? ? $stdin : File.open(input_file, 'r')
+$input_reader = if input_file&.end_with?('.gz')
+  require 'zlib'
+  Zlib::GzipReader.wrap($input)
+else
+  $input
+end
+$output = output_file.nil? ? $stdout : File.open(output_file, 'w')
+
+#####
+
+if ARGV.include?('console')
+  require 'irb'
+  ARGV.clear
+  IRB.start
+  exit!
+end
+
+if $schema
+  while(line = $schema.gets)
+    case line
+    when /^CREATE TABLE /
+      handle_create_table(line, input: $schema, write_to_output: false)
+    end
+  end
+  $schema.close
+end
+
+$report_progress = STDOUT.isatty && $progress && $input.stat.size.nonzero?
+$start_time = Time.now
+
+while(line = $input_reader.gets)
+  report_progress
+  case line
+  when /^CREATE TABLE /
+    handle_create_table(line)
+  when /^COPY /
+    handle_copy(line)
+  when /^INSERT INTO /
+    handle_insert(line)
+  else
+    $output.print line
+  end
+end
+
+$input_reader.close unless input_file.nil?
+$output.close unless output_file.nil?
